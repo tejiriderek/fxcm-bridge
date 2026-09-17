@@ -86,9 +86,9 @@ def collect_snapshot(session) -> dict:
     pairs = {}
     try:
         # Get the Offers table using TableManager
-        from forexconnect import O2GTable
+        from forexconnect import ForexConnect
         table_manager = session.table_manager
-        offers_table = table_manager.get_table(O2GTable.Offers)
+        offers_table = table_manager.get_table(ForexConnect.OFFERS)
         
         # Convert to pandas DataFrame for easier manipulation
         from forexconnect.common import Common
