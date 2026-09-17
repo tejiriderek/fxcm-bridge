@@ -53,7 +53,7 @@ def main() -> None:
     if not username or not password or not receiver or not secret:
         raise RuntimeError("FXCM_USERNAME, FXCM_PASSWORD, SCANNER_RECEIVER_URL, and FXCM_BRIDGE_SHARED_SECRET are required")
 
-    from forexconnect import ForexConnect, SessionStatusListener, ResponseListener
+    from forexconnect import ForexConnect
 
     while True:
         try:
@@ -86,8 +86,9 @@ def collect_snapshot(session) -> dict:
     pairs = {}
     try:
         # Get the Offers table using TableManager
+        from forexconnect import O2GTable
         table_manager = session.table_manager
-        offers_table = table_manager.get_table("Offers")
+        offers_table = table_manager.get_table(O2GTable.Offers)
         
         # Convert to pandas DataFrame for easier manipulation
         from forexconnect.common import Common
