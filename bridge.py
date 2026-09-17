@@ -152,6 +152,7 @@ def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
 
     try:
         now = datetime.utcnow()
+        now_utc = datetime.now(timezone.utc)
         if timeframe == "D1":
             start = now - timedelta(days=10)
         else:
@@ -206,7 +207,35 @@ def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
                 pass
             _history_cache[col_diag_key] = True
 
-        row = df.iloc[-1]
+        interval = timedelta(days=1 if timeframe == "D1" else 4 / 24)
+
+        def raw_timestamp(candidate):
+            for name in ("Date", "date", "Time", "time", "Datetime", "datetime"):
+                if name in df.columns and candidate[name] is not None:
+                    return candidate[name]
+            values = list(candidate.values) if hasattr(candidate, "values") else list(candidate)
+            return values[0] if values else None
+
+        completed_rows = []
+        for _, candidate in df.iterrows():
+            raw = raw_timestamp(candidate)
+            if raw is None:
+                continue
+            try:
+                parsed = pd.Timestamp(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.tz_localize("UTC")
+                parsed = parsed.tz_convert("UTC").to_pydatetime()
+            except (TypeError, ValueError):
+                continue
+            if parsed + interval <= now_utc:
+                completed_rows.append((parsed, candidate))
+        if not completed_rows:
+            log.warning("No completed %s candle returned for %s", timeframe, instrument)
+            _history_cache[cache_key] = (None, now_epoch)
+            return None
+
+        candle_timestamp, row = sorted(completed_rows, key=lambda item: item[0])[-1]
 
         def col(*names):
             for n in names:
@@ -246,7 +275,7 @@ def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
             return None
 
         result = {
-            "timestamp": str(ts if ts is not None else ""),
+            "timestamp": candle_timestamp.isoformat(),
             "open": float(o),
             "high": float(h),
             "low": float(l),
