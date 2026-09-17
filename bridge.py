@@ -18,9 +18,8 @@ log = logging.getLogger("fxcm_bridge")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 PAIRS = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY", "EURAUD": "EUR/AUD", "NZDCAD": "NZD/CAD"}
 
-# Cache history so we don't call get_history on every 30-second poll
 _history_cache: dict = {}
-_HISTORY_CACHE_TTL = {"D1": 1800, "H4": 600}  # seconds
+_HISTORY_CACHE_TTL = {"D1": 1800, "H4": 600}
 
 app = Flask(__name__)
 bridge_running = False
@@ -130,15 +129,16 @@ def collect_snapshot(session) -> dict:
 
 def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
     """
-    Fetch the most recent completed OHLC candle using ForexConnect's
+    Fetch the most recent completed OHLC candle via ForexConnect's
     native get_history method.
 
-    FXCM's Python API returns a pandas DataFrame with columns like:
-        Date, BidOpen, BidHigh, BidLow, BidClose,
-        AskOpen, AskHigh, AskLow, AskClose, Volume
+    FXCM's Python API returns different shapes depending on version:
+      - pandas DataFrame with columns Date, BidOpen, BidHigh, BidLow, BidClose, ...
+      - list of dicts with the same keys
+      - list of tuples (Date, BidOpen, BidHigh, BidLow, BidClose, ...)
 
-    We take the last row as the most recent completed candle.
-    Result is cached so we don't hammer the API on every 30-second poll.
+    We normalize to pandas DataFrame, resolve column names, and fall back
+    to positional access if named columns aren't available.
     """
     cache_key = f"{instrument}|{timeframe}"
     now_epoch = time.time()
@@ -151,12 +151,10 @@ def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
             return candle
 
     try:
-        # Use a naive UTC datetime — some ForexConnect versions reject
-        # timezone-aware datetimes.
         now = datetime.utcnow()
         if timeframe == "D1":
             start = now - timedelta(days=10)
-        else:  # H4
+        else:
             start = now - timedelta(days=3)
 
         try:
@@ -171,56 +169,84 @@ def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
             _history_cache[cache_key] = (None, now_epoch)
             return None
 
-        # Extract the last row — handle DataFrame (typical) or list
+        # === DIAGNOSTIC: log type and a short repr once per pair/timeframe ===
+        diag_key = f"{cache_key}|diag_logged"
+        if not _history_cache.get(diag_key):
+            try:
+                log.info("get_history type=%s repr=%s",
+                         type(history).__name__, repr(history)[:400])
+            except Exception:
+                pass
+            _history_cache[diag_key] = True
+
+        # Normalize to pandas DataFrame
+        import pandas as pd
+        df = None
         try:
-            if hasattr(history, "empty"):
-                # pandas DataFrame
-                if history.empty:
-                    log.warning("Empty history for %s %s", instrument, timeframe)
-                    _history_cache[cache_key] = (None, now_epoch)
-                    return None
-                row = history.iloc[-1]
+            if isinstance(history, pd.DataFrame):
+                df = history
             else:
-                # list-like fallback
-                if len(history) == 0:
-                    log.warning("Empty history for %s %s", instrument, timeframe)
-                    _history_cache[cache_key] = (None, now_epoch)
-                    return None
-                row = history[-1]
-        except Exception as inner:
-            log.warning("Could not read history rows for %s %s: %s: %s",
-                        instrument, timeframe, type(inner).__name__, inner)
+                df = pd.DataFrame(history)
+        except Exception as conv_e:
+            log.warning("Could not convert history to DataFrame for %s %s: %s",
+                        instrument, timeframe, conv_e)
+
+        if df is None or df.empty:
+            log.warning("Empty history for %s %s", instrument, timeframe)
             _history_cache[cache_key] = (None, now_epoch)
             return None
 
-        # Normalize column access — support Series (DataFrame row) or dict
-        def pick(*keys, default=None):
-            for k in keys:
+        # Log columns once so we know what we're dealing with
+        col_diag_key = f"{cache_key}|cols_logged"
+        if not _history_cache.get(col_diag_key):
+            try:
+                log.info("history columns for %s %s: %s",
+                         instrument, timeframe, list(df.columns))
+            except Exception:
+                pass
+            _history_cache[col_diag_key] = True
+
+        row = df.iloc[-1]
+
+        def col(*names):
+            for n in names:
                 try:
-                    if hasattr(row, "get"):
-                        val = row.get(k)
-                    else:
-                        val = row[k] if k in row else None
-                    if val is not None:
-                        return val
+                    if n in df.columns:
+                        v = row[n]
+                        if v is not None:
+                            return v
                 except Exception:
                     continue
-            return default
+            return None
 
-        ts_raw = pick("Date", "date", "Time", "time", default="")
-        o = pick("BidOpen", "Open", "open")
-        h = pick("BidHigh", "High", "high")
-        l = pick("BidLow", "Low", "low")
-        c = pick("BidClose", "Close", "close")
+        ts = col("Date", "date", "Time", "time", "Datetime", "datetime")
+        o = col("BidOpen", "Open", "open")
+        h = col("BidHigh", "High", "high")
+        l = col("BidLow", "Low", "low")
+        c = col("BidClose", "Close", "close")
+
+        # Positional fallback (common FXCM order: Date, BidOpen, BidHigh, BidLow, BidClose, ...)
+        if o is None or h is None or l is None or c is None:
+            try:
+                vals = list(row.values) if hasattr(row, "values") else list(row)
+                if len(vals) >= 5:
+                    ts = ts if ts is not None else vals[0]
+                    o = o if o is not None else vals[1]
+                    h = h if h is not None else vals[2]
+                    l = l if l is not None else vals[3]
+                    c = c if c is not None else vals[4]
+            except Exception as pos_e:
+                log.warning("Positional fallback failed for %s %s: %s",
+                            instrument, timeframe, pos_e)
 
         if o is None or h is None or l is None or c is None:
-            log.warning("Missing OHLC fields for %s %s. Columns: %s",
-                        instrument, timeframe, list(row.index) if hasattr(row, "index") else "n/a")
+            log.warning("Missing OHLC fields for %s %s. First row repr: %s",
+                        instrument, timeframe, repr(row)[:400])
             _history_cache[cache_key] = (None, now_epoch)
             return None
 
         result = {
-            "timestamp": str(ts_raw),
+            "timestamp": str(ts if ts is not None else ""),
             "open": float(o),
             "high": float(h),
             "low": float(l),
@@ -228,7 +254,8 @@ def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
             "completed": True,
         }
         _history_cache[cache_key] = (result, now_epoch)
-        log.info("Fetched FXCM candle %s %s: %s", instrument, timeframe, ts_raw)
+        log.info("Fetched FXCM candle %s %s: ts=%s O=%s H=%s L=%s C=%s",
+                 instrument, timeframe, ts, o, h, l, c)
         return result
 
     except Exception as e:
