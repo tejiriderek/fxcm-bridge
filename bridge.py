@@ -130,20 +130,15 @@ def collect_snapshot(session) -> dict:
 
 def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
     """
-    Fetch the most recent completed OHLC candle using ForexConnect's native
-    get_history method.
+    Fetch the most recent completed OHLC candle using ForexConnect's
+    native get_history method.
 
-    FXCM's Python API exposes:
-        fx.get_history(instrument, timeframe, start, end)
+    FXCM's Python API returns a pandas DataFrame with columns like:
+        Date, BidOpen, BidHigh, BidLow, BidClose,
+        AskOpen, AskHigh, AskLow, AskClose, Volume
 
-    The returned list contains dicts with keys like:
-        Date, BidOpen, BidHigh, BidLow, BidClose, AskOpen, AskHigh, AskLow, AskClose, Volume
-
-    The timeframe strings FXCM accepts include: 'm1', 'm5', 'm15', 'm30', 'H1',
-    'H2', 'H4', 'H6', 'H8', 'D1', 'W1', 'M1'.
-
-    We take the last entry in the list as the most recent completed candle.
-    Result is cached so we don't hammer the API on every poll.
+    We take the last row as the most recent completed candle.
+    Result is cached so we don't hammer the API on every 30-second poll.
     """
     cache_key = f"{instrument}|{timeframe}"
     now_epoch = time.time()
@@ -157,50 +152,79 @@ def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
 
     try:
         # Use a naive UTC datetime — some ForexConnect versions reject
-        # timezone-aware datetimes in get_history.
+        # timezone-aware datetimes.
         now = datetime.utcnow()
         if timeframe == "D1":
             start = now - timedelta(days=10)
         else:  # H4
             start = now - timedelta(days=3)
 
-        # Try the native session.get_history first.
-        history = None
         try:
             history = session.get_history(instrument, timeframe, start, now)
         except AttributeError:
-            # Session doesn't have get_history (older/newer SDK variants)
             log.error("session.get_history not available; cannot fetch history")
             _history_cache[cache_key] = (None, now_epoch)
             return None
 
-        if not history:
+        if history is None:
             log.warning("No history returned for %s %s", instrument, timeframe)
             _history_cache[cache_key] = (None, now_epoch)
             return None
 
-        # Last row is the most recent completed candle
-        candle = history[-1]
+        # Extract the last row — handle DataFrame (typical) or list
+        try:
+            if hasattr(history, "empty"):
+                # pandas DataFrame
+                if history.empty:
+                    log.warning("Empty history for %s %s", instrument, timeframe)
+                    _history_cache[cache_key] = (None, now_epoch)
+                    return None
+                row = history.iloc[-1]
+            else:
+                # list-like fallback
+                if len(history) == 0:
+                    log.warning("Empty history for %s %s", instrument, timeframe)
+                    _history_cache[cache_key] = (None, now_epoch)
+                    return None
+                row = history[-1]
+        except Exception as inner:
+            log.warning("Could not read history rows for %s %s: %s: %s",
+                        instrument, timeframe, type(inner).__name__, inner)
+            _history_cache[cache_key] = (None, now_epoch)
+            return None
 
-        # Normalize keys (FXCM uses BidOpen/BidHigh/etc.)
-        def pick(d, *keys, default=0.0):
+        # Normalize column access — support Series (DataFrame row) or dict
+        def pick(*keys, default=None):
             for k in keys:
-                if k in d:
-                    return d[k]
+                try:
+                    if hasattr(row, "get"):
+                        val = row.get(k)
+                    else:
+                        val = row[k] if k in row else None
+                    if val is not None:
+                        return val
+                except Exception:
+                    continue
             return default
 
-        ts_raw = pick(candle, "Date", "date", "Time", "time", default="")
-        o = float(pick(candle, "BidOpen", "Open", "open"))
-        h = float(pick(candle, "BidHigh", "High", "high"))
-        l = float(pick(candle, "BidLow", "Low", "low"))
-        c = float(pick(candle, "BidClose", "Close", "close"))
+        ts_raw = pick("Date", "date", "Time", "time", default="")
+        o = pick("BidOpen", "Open", "open")
+        h = pick("BidHigh", "High", "high")
+        l = pick("BidLow", "Low", "low")
+        c = pick("BidClose", "Close", "close")
+
+        if o is None or h is None or l is None or c is None:
+            log.warning("Missing OHLC fields for %s %s. Columns: %s",
+                        instrument, timeframe, list(row.index) if hasattr(row, "index") else "n/a")
+            _history_cache[cache_key] = (None, now_epoch)
+            return None
 
         result = {
             "timestamp": str(ts_raw),
-            "open": o,
-            "high": h,
-            "low": l,
-            "close": c,
+            "open": float(o),
+            "high": float(h),
+            "low": float(l),
+            "close": float(c),
             "completed": True,
         }
         _history_cache[cache_key] = (result, now_epoch)
