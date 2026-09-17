@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import gzip
 import logging
 import os
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -18,11 +17,6 @@ load_dotenv()
 log = logging.getLogger("fxcm_bridge")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 PAIRS = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY", "EURAUD": "EUR/AUD", "NZDCAD": "NZD/CAD"}
-
-# Cache for historical candles to avoid hammering the FXCM candledata endpoint
-# key: "EURUSD|D1", value: (candle_dict_or_None, fetched_at_epoch)
-_history_cache: dict = {}
-_HISTORY_CACHE_TTL = {"D1": 1800, "H4": 600}  # seconds (30 min / 10 min)
 
 app = Flask(__name__)
 bridge_running = False
@@ -112,8 +106,8 @@ def collect_snapshot(session) -> dict:
                     "ask": ask,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "ohlc": {
-                        "D1": get_history_candle(pair, 'D1'),
-                        "H4": get_history_candle(pair, 'H4'),
+                        "D1": get_history_candle(session, instrument, 'D1'),
+                        "H4": get_history_candle(session, instrument, 'H4'),
                     },
                 }
             except Exception as e:
@@ -125,100 +119,51 @@ def collect_snapshot(session) -> dict:
     return {"source": "fxcm", "account_type": "demo", "sent_at": datetime.now(timezone.utc).isoformat(), "pairs": pairs}
 
 
-def get_history_candle(pair: str, timeframe: str) -> dict | None:
+def get_history_candle(session, instrument: str, timeframe: str) -> dict | None:
     """
-    Fetch the most recent completed OHLC candle for a pair/timeframe from FXCM's
-    public candledata HTTP endpoint.
+    Fetch the most recent completed OHLC candle using ForexConnect's native
+    get_history method.
 
-    URL format: https://candledata.fxcorporate.com/{periodicity}/{symbol}/{year}/{week}.csv.gz
-    CSV columns: DateTime,BidOpen,BidHigh,BidLow,BidClose,AskOpen,AskHigh,AskLow,AskClose,Volume
+    The method signature is:
+        fx.get_history(instrument, timeframe, start_date, end_date)
 
-    Caches results to avoid making a network request on every 30-second poll.
-    Returns None if data cannot be fetched (bridge keeps working with live prices).
+    It returns a list of dicts with keys like Date, BidOpen, BidHigh,
+    BidLow, BidClose, Volume. We take the last row as the most recent
+    completed candle.
+
+    ForexConnect timeframe strings: 'D1' (daily), 'H4' (4-hour), etc.
+    Returns None if data cannot be fetched.
     """
-    cache_key = f"{pair}|{timeframe}"
-    now_epoch = time.time()
-    
-    # Check cache first
-    cached = _history_cache.get(cache_key)
-    if cached is not None:
-        candle, fetched_at = cached
-        ttl = _HISTORY_CACHE_TTL.get(timeframe, 600)
-        if now_epoch - fetched_at < ttl:
-            return candle
-    
     try:
-        periodicity = timeframe  # 'D1' and 'H4' are valid FXCM periodicities
-        symbol = pair  # EURUSD, GBPUSD, etc. (no slash needed)
-        
+        # Request a small window: enough to get the last completed candle.
+        # We use 10 days for D1 and 3 days for H4 to keep the request light.
         now = datetime.now(timezone.utc)
-        iso_year, iso_week, _ = now.isocalendar()
+        if timeframe == 'D1':
+            start = now - timedelta(days=10)
+        else:  # H4
+            start = now - timedelta(days=3)
         
-        # Try current week first, then previous week (useful early in the week
-        # when the current week's file may not exist or may be empty yet)
-        attempts = [(iso_year, iso_week)]
-        prev_week = iso_week - 1
-        prev_year = iso_year
-        if prev_week < 1:
-            prev_week = 52
-            prev_year -= 1
-        attempts.append((prev_year, prev_week))
+        # get_history expects timezone-aware datetimes
+        history = session.get_history(instrument, timeframe, start, now)
         
-        for year, week in attempts:
-            url = f"https://candledata.fxcorporate.com/{periodicity}/{symbol}/{year}/{week}.csv.gz"
-            try:
-                response = requests.get(url, timeout=15)
-                if response.status_code != 200:
-                    log.debug("Candledata %s returned HTTP %s", url, response.status_code)
-                    continue
-                
-                content = gzip.decompress(response.content)
-                text = content.decode("utf-8", errors="ignore").strip()
-                if not text:
-                    continue
-                
-                lines = text.split("\n")
-                # Skip header row if present (first field won't be a date)
-                data_lines = [
-                    ln for ln in lines
-                    if ln and not ln.lower().startswith("datetime")
-                ]
-                if not data_lines:
-                    continue
-                
-                # Last line = most recent completed candle
-                last = data_lines[-1].split(",")
-                if len(last) < 5:
-                    continue
-                
-                # Use bid OHLC (columns 1-4)
-                ts = last[0].strip()
-                o = float(last[1])
-                h = float(last[2])
-                l = float(last[3])
-                c = float(last[4])
-                
-                candle = {
-                    "timestamp": ts,
-                    "open": o,
-                    "high": h,
-                    "low": l,
-                    "close": c,
-                    "completed": True,
-                }
-                _history_cache[cache_key] = (candle, now_epoch)
-                log.info("Fetched FXCM candle %s %s: %s", pair, timeframe, ts)
-                return candle
-            except Exception as inner:
-                log.debug("Candledata fetch failed for %s %s week %s: %s", symbol, periodicity, week, inner)
-                continue
+        if not history:
+            log.warning("No history returned for %s %s", instrument, timeframe)
+            return None
         
-        # All attempts failed — cache the None briefly so we don't retry every poll
-        log.warning("No candledata available for %s %s", pair, timeframe)
-        _history_cache[cache_key] = (None, now_epoch)
-        return None
+        # history is a list of dicts; the last entry is the most recent candle
+        candle = history[-1]
+        
+        # Build a clean OHLC dict from the bid side
+        return {
+            "timestamp": str(candle.get('Date', '')),
+            "open": float(candle.get('BidOpen', 0)),
+            "high": float(candle.get('BidHigh', 0)),
+            "low": float(candle.get('BidLow', 0)),
+            "close": float(candle.get('BidClose', 0)),
+            "completed": True,
+        }
     except Exception as e:
-        log.warning("Failed to get history for %s %s: %s", pair, timeframe, e)
+        log.warning("Failed to get history for %s %s: %s", instrument, timeframe, e)
         return None
 
 
